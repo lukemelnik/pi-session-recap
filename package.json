@@ -1,0 +1,26 @@
+{
+  "name": "pi-session-recap",
+  "version": "0.1.0",
+  "description": "A Pi extension that shows a one-line recap of what the current session has been about.",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "files": ["src", "README.md"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "0.67.68",
+    "@mariozechner/pi-coding-agent": "0.67.68",
+    "@mariozechner/pi-tui": "0.67.68",
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3"
+  }
+}
