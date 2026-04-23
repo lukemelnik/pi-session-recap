@@ -1,15 +1,44 @@
 {
-  "name": "pi-session-recap",
+  "name": "@lukemelnik/pi-session-recap",
   "version": "0.1.0",
   "description": "A Pi extension that shows a one-line recap of what the current session has been about.",
   "type": "module",
-  "keywords": ["pi-package"],
-  "files": ["src", "README.md"],
+  "author": "Luke Melnik",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "session",
+    "recap"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "homepage": "https://github.com/lukemelnik/pi-session-recap#readme",
+  "bugs": {
+    "url": "https://github.com/lukemelnik/pi-session-recap/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lukemelnik/pi-session-recap.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "scripts": {
-    "check": "tsc --noEmit -p tsconfig.json"
+    "check": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "npm run check",
+    "release:patch": "npm run check && npm version patch -m \"chore(release): %s\"",
+    "release:minor": "npm run check && npm version minor -m \"chore(release): %s\"",
+    "release:major": "npm run check && npm version major -m \"chore(release): %s\"",
+    "publish:release": "npm publish"
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
