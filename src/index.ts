@@ -1,6 +1,8 @@
-import { completeSimple, type Message, type UserMessage } from "@mariozechner/pi-ai";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { completeSimple, type Api, type Message, type Model, type UserMessage } from "@mariozechner/pi-ai";
 import { Text } from "@mariozechner/pi-tui";
-import { serializeConversation } from "@mariozechner/pi-coding-agent";
+import { getAgentDir, serializeConversation } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@mariozechner/pi-coding-agent";
 
 const WIDGET_KEY = "session-synopsis";
@@ -15,7 +17,9 @@ const MAX_RECENT_ENTRIES = 160;
 const MAX_CONTEXT_CHARS = 12000;
 const MAX_SUMMARY_GENERATION_TOKENS = 160;
 const MAX_SUMMARY_LINE = 220;
-const SUMMARY_IDLE_DELAY_MS = 30_000;
+const DEFAULT_SUMMARY_DELAY_MS = 30_000;
+const MAX_SUMMARY_DELAY_MS = 24 * 60 * 60 * 1000;
+const CONFIG_PATH = join(getAgentDir(), "session-recap.json");
 
 const SYNOPSIS_SYSTEM_PROMPT = `You are a coding session recap assistant.
 
@@ -25,8 +29,18 @@ Focus on the real task, bug, feature, or decision being worked on.
 Do not mention tool calls, edits, file operations, or generic activity unless that is the only concrete signal.
 Return only the summary text with no label, bullets, or extra commentary.`;
 
-interface SynopsisState {
+type SummaryModelMode = "auto" | "current" | "fixed";
+
+interface SynopsisSettings {
 	enabled: boolean;
+	delayMs: number;
+	modelMode: SummaryModelMode;
+	provider?: string;
+	modelId?: string;
+}
+
+interface SynopsisState {
+	settings: SynopsisSettings;
 	synopsis?: string;
 	lastSummarizedLeafId?: string;
 	generation: number;
@@ -42,6 +56,12 @@ interface SummaryMessage {
 	timestamp: number;
 }
 
+const DEFAULT_SETTINGS: SynopsisSettings = {
+	enabled: true,
+	delayMs: DEFAULT_SUMMARY_DELAY_MS,
+	modelMode: "auto",
+};
+
 function normalizeWhitespace(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
@@ -50,6 +70,82 @@ function truncateText(text: string, max: number): string {
 	if (!text) return text;
 	if (text.length <= max) return text;
 	return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+}
+
+function clampDelayMs(delayMs: number): number {
+	if (!Number.isFinite(delayMs)) return DEFAULT_SUMMARY_DELAY_MS;
+	return Math.max(0, Math.min(MAX_SUMMARY_DELAY_MS, Math.round(delayMs)));
+}
+
+function normalizeSettings(raw: unknown, base: SynopsisSettings = DEFAULT_SETTINGS): SynopsisSettings {
+	if (!raw || typeof raw !== "object") {
+		return { ...base };
+	}
+
+	const input = raw as {
+		enabled?: unknown;
+		delayMs?: unknown;
+		modelMode?: unknown;
+		provider?: unknown;
+		modelId?: unknown;
+	};
+	const modelMode: SummaryModelMode =
+		input.modelMode === "current" || input.modelMode === "fixed" || input.modelMode === "auto"
+			? input.modelMode
+			: base.modelMode;
+	const provider = typeof input.provider === "string" && input.provider.trim() ? input.provider.trim() : base.provider;
+	const modelId = typeof input.modelId === "string" && input.modelId.trim() ? input.modelId.trim() : base.modelId;
+
+	return {
+		enabled: typeof input.enabled === "boolean" ? input.enabled : base.enabled,
+		delayMs: typeof input.delayMs === "number" ? clampDelayMs(input.delayMs) : base.delayMs,
+		modelMode: modelMode === "fixed" && (!provider || !modelId) ? "auto" : modelMode,
+		provider: modelMode === "fixed" ? provider : undefined,
+		modelId: modelMode === "fixed" ? modelId : undefined,
+	};
+}
+
+async function loadSettingsFromDisk(): Promise<SynopsisSettings> {
+	try {
+		const text = await readFile(CONFIG_PATH, "utf-8");
+		return normalizeSettings(JSON.parse(text));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return { ...DEFAULT_SETTINGS };
+		}
+		throw error;
+	}
+}
+
+async function saveSettingsToDisk(settings: SynopsisSettings): Promise<void> {
+	await mkdir(dirname(CONFIG_PATH), { recursive: true });
+	await writeFile(CONFIG_PATH, `${JSON.stringify(settings, null, "\t")}\n`, "utf-8");
+}
+
+function getPersistedSessionSettings(ctx: ExtensionContext): Partial<SynopsisSettings> {
+	const entries = ctx.sessionManager.getBranch();
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type !== "custom" || entry.customType !== SETTINGS_ENTRY_TYPE) continue;
+		const data = entry.data;
+		if (!data || typeof data !== "object") continue;
+		const normalized = normalizeSettings(data, DEFAULT_SETTINGS);
+		const result: Partial<SynopsisSettings> = {};
+		if (typeof (data as { enabled?: unknown }).enabled === "boolean") result.enabled = normalized.enabled;
+		if (typeof (data as { delayMs?: unknown }).delayMs === "number") result.delayMs = normalized.delayMs;
+		if (typeof (data as { modelMode?: unknown }).modelMode === "string") {
+			result.modelMode = normalized.modelMode;
+			result.provider = normalized.provider;
+			result.modelId = normalized.modelId;
+		}
+		return result;
+	}
+	return {};
+}
+
+async function loadSettings(ctx: ExtensionContext): Promise<SynopsisSettings> {
+	const diskSettings = await loadSettingsFromDisk();
+	return normalizeSettings({ ...diskSettings, ...getPersistedSessionSettings(ctx) });
 }
 
 type MessageLike = { role?: unknown; content?: unknown; timestamp?: unknown; toolName?: unknown };
@@ -379,26 +475,91 @@ function renderSynopsis(ctx: ExtensionContext, summary: string | undefined): voi
 	);
 }
 
-function getPersistedEnabledState(ctx: ExtensionContext): boolean {
-	const entries = ctx.sessionManager.getEntries();
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const entry = entries[i];
-		if (entry.type !== "custom" || entry.customType !== SETTINGS_ENTRY_TYPE) continue;
-		const data = entry.data as { enabled?: unknown } | undefined;
-		if (typeof data?.enabled === "boolean") {
-			return data.enabled;
-		}
+function formatDuration(ms: number): string {
+	if (ms === 0) return "immediately";
+	if (ms < 1000) return `${ms}ms`;
+	if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+	if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+	if (ms % 1000 === 0) return `${ms / 1000}s`;
+	return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function parseDelay(value: string): number | "default" | undefined {
+	const normalized = normalizeWhitespace(value).toLowerCase();
+	if (normalized === "default" || normalized === "reset") return "default";
+	const match = normalized.match(/^(\d+(?:\.\d+)?)\s*(ms|millisecond|milliseconds|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?$/u);
+	if (!match) return undefined;
+
+	const amount = Number(match[1]);
+	const unit = match[2] ?? "s";
+	const multiplier = unit.startsWith("ms") || unit.startsWith("millisecond") ? 1 : unit.startsWith("m") ? 60_000 : unit.startsWith("h") ? 3_600_000 : 1000;
+	return clampDelayMs(amount * multiplier);
+}
+
+function formatModelSpec(provider: string, modelId: string): string {
+	return `${provider}/${modelId}`;
+}
+
+function formatModel(model: Model<Api>): string {
+	return formatModelSpec(model.provider, model.id);
+}
+
+function parseModelSpec(value: string): { provider: string; modelId: string } | undefined {
+	const normalized = normalizeWhitespace(value);
+	const separator = normalized.indexOf("/");
+	if (separator <= 0 || separator === normalized.length - 1) return undefined;
+	return {
+		provider: normalized.slice(0, separator),
+		modelId: normalized.slice(separator + 1),
+	};
+}
+
+function formatModelSetting(settings: SynopsisSettings): string {
+	if (settings.modelMode === "current") return "current active model";
+	if (settings.modelMode === "fixed" && settings.provider && settings.modelId) {
+		return formatModelSpec(settings.provider, settings.modelId);
 	}
-	return true;
+	return "auto (cheap candidate, then current model)";
+}
+
+async function getAuthenticatedModel(
+	ctx: ExtensionContext,
+	model: Model<Api> | undefined,
+): Promise<{ model: Model<Api>; auth: { ok: true; apiKey?: string; headers?: Record<string, string> } } | undefined> {
+	if (!model) return undefined;
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok) return undefined;
+	return { model, auth };
+}
+
+async function resolveSummaryModel(
+	ctx: ExtensionContext,
+	settings: SynopsisSettings,
+): Promise<{ model: Model<Api>; auth: { ok: true; apiKey?: string; headers?: Record<string, string> } } | undefined> {
+	if (settings.modelMode === "fixed") {
+		return getAuthenticatedModel(ctx, ctx.modelRegistry.find(settings.provider ?? "", settings.modelId ?? ""));
+	}
+
+	if (settings.modelMode === "current") {
+		return getAuthenticatedModel(ctx, ctx.model);
+	}
+
+	for (const candidate of SUMMARY_MODEL_CANDIDATES) {
+		const resolved = await getAuthenticatedModel(ctx, ctx.modelRegistry.find(candidate.provider, candidate.modelId));
+		if (resolved) return resolved;
+	}
+
+	return getAuthenticatedModel(ctx, ctx.model);
 }
 
 export default function (pi: ExtensionAPI) {
 	const state: SynopsisState = {
-		enabled: true,
+		settings: { ...DEFAULT_SETTINGS },
 		generation: 0,
 		inFlight: false,
 		pending: false,
 	};
+	let modelCompletionItems: Array<{ value: string; label: string; description?: string }> = [];
 
 	const clearScheduledUpdate = (): void => {
 		if (state.idleTimer) {
@@ -407,9 +568,17 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const reset = (ctx: ExtensionContext) => {
+	const reset = async (ctx: ExtensionContext) => {
 		clearScheduledUpdate();
-		state.enabled = getPersistedEnabledState(ctx);
+		try {
+			state.settings = await loadSettings(ctx);
+		} catch (error) {
+			state.settings = { ...DEFAULT_SETTINGS };
+			if (ctx.hasUI) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Failed to load session recap settings: ${message}`, "warning");
+			}
+		}
 		state.generation += 1;
 		state.synopsis = undefined;
 		state.lastSummarizedLeafId = undefined;
@@ -419,8 +588,8 @@ export default function (pi: ExtensionAPI) {
 		renderSynopsis(ctx, undefined);
 	};
 
-	const generateSynopsis = async (ctx: ExtensionContext) => {
-		if (!ctx.hasUI || !state.enabled || !ctx.isIdle()) return;
+	const generateSynopsis = async (ctx: ExtensionContext, options: { force?: boolean } = {}) => {
+		if (!ctx.hasUI || !state.settings.enabled || (!options.force && !ctx.isIdle())) return;
 		if (state.inFlight) {
 			state.pending = true;
 			state.pendingCtx = ctx;
@@ -434,47 +603,18 @@ export default function (pi: ExtensionAPI) {
 			const branch = ctx.sessionManager.getBranch();
 			const conversationText = buildConversationText(branch, state.lastSummarizedLeafId);
 			if (!conversationText) {
-				renderSynopsis(ctx, state.enabled ? state.synopsis : undefined);
+				renderSynopsis(ctx, state.settings.enabled ? state.synopsis : undefined);
 				return;
 			}
 
-			let model: ReturnType<(typeof ctx.modelRegistry.find)> | null = null;
-			let auth: Awaited<ReturnType<typeof ctx.modelRegistry.getApiKeyAndHeaders>> | undefined;
-
-			for (const candidate of SUMMARY_MODEL_CANDIDATES) {
-				const candidateModel = ctx.modelRegistry.find(candidate.provider, candidate.modelId);
-				if (!candidateModel) {
-					continue;
-				}
-
-				const candidateAuth = await ctx.modelRegistry.getApiKeyAndHeaders(candidateModel);
-				if (candidateAuth.ok) {
-					model = candidateModel;
-					auth = candidateAuth;
-					break;
-				}
-			}
-
-			if (!model && ctx.model) {
-				const fallbackAuth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-				if (fallbackAuth.ok) {
-					model = ctx.model;
-					auth = fallbackAuth;
-				}
-			}
-
-			if (!model) {
+			const summaryModel = await resolveSummaryModel(ctx, state.settings);
+			if (!summaryModel) {
 				state.synopsis = buildFallbackSynopsis(branch, state.lastSummarizedLeafId, state.synopsis);
 				state.lastSummarizedLeafId = branch.at(-1)?.id;
 				renderSynopsis(ctx, state.synopsis);
 				return;
 			}
-			if (!auth || !auth.ok) {
-				state.synopsis = buildFallbackSynopsis(branch, state.lastSummarizedLeafId, state.synopsis);
-				state.lastSummarizedLeafId = branch.at(-1)?.id;
-				renderSynopsis(ctx, state.synopsis);
-				return;
-			}
+			const { model, auth } = summaryModel;
 
 			const userMessage: UserMessage = {
 				role: "user",
@@ -499,7 +639,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				);
 
-				if (generation !== state.generation || !ctx.hasUI || !state.enabled || !ctx.isIdle()) {
+				if (generation !== state.generation || !ctx.hasUI || !state.settings.enabled || (!options.force && !ctx.isIdle())) {
 					return;
 				}
 				if (response.stopReason === "error" || response.stopReason === "aborted") {
@@ -545,22 +685,29 @@ export default function (pi: ExtensionAPI) {
 
 	const scheduleUpdate = (ctx: ExtensionContext): void => {
 		clearScheduledUpdate();
-		if (!ctx.hasUI || !state.enabled) return;
+		if (!ctx.hasUI || !state.settings.enabled) return;
 		void generateSynopsis(ctx);
 	};
 
 	const scheduleIdleUpdate = (ctx: ExtensionContext): void => {
 		clearScheduledUpdate();
-		if (!ctx.hasUI || !state.enabled) return;
+		if (!ctx.hasUI || !state.settings.enabled) return;
 		state.idleTimer = setTimeout(() => {
 			state.idleTimer = undefined;
 			void generateSynopsis(ctx);
-		}, SUMMARY_IDLE_DELAY_MS);
+		}, state.settings.delayMs);
 	};
 
-	const setEnabled = (ctx: ExtensionContext, enabled: boolean): void => {
+	const persistSettings = async (ctx: ExtensionContext): Promise<void> => {
+		state.settings = normalizeSettings(state.settings);
+		await saveSettingsToDisk(state.settings);
+		pi.appendEntry(SETTINGS_ENTRY_TYPE, state.settings);
+	};
+
+	const setEnabled = async (ctx: ExtensionContext, enabled: boolean): Promise<void> => {
 		clearScheduledUpdate();
-		state.enabled = enabled;
+		state.settings = { ...state.settings, enabled };
+		await persistSettings(ctx);
 		state.generation += 1;
 		state.pending = false;
 		state.pendingCtx = undefined;
@@ -574,49 +721,238 @@ export default function (pi: ExtensionAPI) {
 		scheduleUpdate(ctx);
 	};
 
-	pi.registerCommand("summary", {
-		description: "Show, hide, or toggle the session synopsis (usage: /summary [on|off|toggle|status])",
+	const refreshModelCompletions = (ctx: ExtensionContext): void => {
+		const seen = new Set<string>();
+		modelCompletionItems = [];
+		for (const model of ctx.modelRegistry.getAvailable().slice().sort((a, b) => formatModel(a).localeCompare(formatModel(b)))) {
+			const spec = formatModel(model);
+			if (seen.has(spec)) continue;
+			seen.add(spec);
+			modelCompletionItems.push({
+				value: `model ${spec}`,
+				label: spec,
+				description: model.name ? `${model.provider} — ${model.name}` : model.provider,
+			});
+		}
+	};
+
+	const getSessionRecapCompletions = (argumentPrefix: string) => {
+		const prefix = argumentPrefix.replace(/\s+/g, " ").toLowerCase();
+		const topLevel = [
+			{ value: "on", label: "on", description: "Show the recap widget and refresh after agent turns" },
+			{ value: "off", label: "off", description: "Hide the recap widget and stop refreshing" },
+			{ value: "toggle", label: "toggle", description: "Toggle recap visibility" },
+			{ value: "status", label: "status", description: "Show current session recap settings" },
+			{ value: "refresh", label: "refresh", description: "Regenerate the recap immediately" },
+			{ value: "model ", label: "model", description: "Pick or set the recap model" },
+			{ value: "delay ", label: "delay", description: "Set refresh delay, e.g. 30s or 2m" },
+		];
+
+		if (prefix.startsWith("model ")) {
+			const modelPrefix = prefix.slice("model ".length);
+			return [
+				{ value: "model auto", label: "auto", description: "Use cheap recap candidates, then the active model" },
+				{ value: "model current", label: "current", description: "Always use the active Pi model" },
+				...modelCompletionItems,
+			].filter((item) => item.value.toLowerCase().startsWith("model " + modelPrefix));
+		}
+
+		if (prefix.startsWith("delay ")) {
+			const delayPrefix = prefix.slice("delay ".length);
+			return [
+				{ value: "delay 10s", label: "10s", description: "Refresh ten seconds after each agent turn" },
+				{ value: "delay 30s", label: "30s", description: "Default refresh delay" },
+				{ value: "delay 1m", label: "1m", description: "Refresh one minute after each agent turn" },
+				{ value: "delay 2m", label: "2m", description: "Refresh two minutes after each agent turn" },
+				{ value: "delay 5m", label: "5m", description: "Refresh five minutes after each agent turn" },
+				{ value: "delay default", label: "default", description: "Restore the default 30 second delay" },
+			].filter((item) => item.value.toLowerCase().startsWith("delay " + delayPrefix));
+		}
+
+		return topLevel.filter((item) => item.value.toLowerCase().startsWith(prefix));
+	};
+
+	const chooseSummaryModel = async (ctx: ExtensionContext): Promise<SynopsisSettings | undefined> => {
+		if (!ctx.hasUI) return undefined;
+
+		const choices: Array<{ label: string; settings: SynopsisSettings }> = [
+			{
+				label: "Auto — first available recap model, then current active model",
+				settings: { ...state.settings, modelMode: "auto", provider: undefined, modelId: undefined },
+			},
+			{
+				label: ctx.model ? `Current active model — ${formatModel(ctx.model)}` : "Current active model",
+				settings: { ...state.settings, modelMode: "current", provider: undefined, modelId: undefined },
+			},
+		];
+
+		const availableModels = ctx.modelRegistry
+			.getAvailable()
+			.slice()
+			.sort((a, b) => formatModel(a).localeCompare(formatModel(b)));
+		for (const model of availableModels) {
+			choices.push({
+				label: formatModel(model),
+				settings: { ...state.settings, modelMode: "fixed", provider: model.provider, modelId: model.id },
+			});
+		}
+
+		const selected = await ctx.ui.select(
+			"Select recap model:",
+			choices.map((choice) => choice.label),
+		);
+		return choices.find((choice) => choice.label === selected)?.settings;
+	};
+
+	const setSummaryModel = async (ctx: ExtensionContext, spec: string): Promise<void> => {
+		const normalizedSpec = normalizeWhitespace(spec).toLowerCase();
+		if (!normalizedSpec) {
+			const selected = await chooseSummaryModel(ctx);
+			if (!selected) return;
+			state.settings = normalizeSettings(selected);
+		} else if (normalizedSpec === "auto") {
+			state.settings = { ...state.settings, modelMode: "auto", provider: undefined, modelId: undefined };
+		} else if (normalizedSpec === "current") {
+			if (!ctx.model) {
+				ctx.ui.notify("No current active model is selected.", "warning");
+				return;
+			}
+			state.settings = { ...state.settings, modelMode: "current", provider: undefined, modelId: undefined };
+		} else {
+			const parsed = parseModelSpec(spec);
+			if (!parsed) {
+				ctx.ui.notify("Usage: /session-recap model [auto|current|provider/model-id]", "warning");
+				return;
+			}
+
+			const model = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
+			if (!model) {
+				ctx.ui.notify(`Model not found: ${formatModelSpec(parsed.provider, parsed.modelId)}`, "warning");
+				return;
+			}
+
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (!auth.ok) {
+				ctx.ui.notify(`No usable auth for ${formatModel(model)}: ${auth.error}`, "warning");
+				return;
+			}
+
+			state.settings = {
+				...state.settings,
+				modelMode: "fixed",
+				provider: model.provider,
+				modelId: model.id,
+			};
+		}
+
+		state.lastSummarizedLeafId = undefined;
+		await persistSettings(ctx);
+		ctx.ui.notify(`Recap model: ${formatModelSetting(state.settings)}`, "info");
+		scheduleUpdate(ctx);
+	};
+
+	const setSummaryDelay = async (ctx: ExtensionContext, value: string): Promise<void> => {
+		if (!value) {
+			ctx.ui.notify(`Session recap delay: ${formatDuration(state.settings.delayMs)}`, "info");
+			return;
+		}
+
+		const parsed = parseDelay(value);
+		if (parsed === undefined) {
+			ctx.ui.notify("Usage: /session-recap delay [30s|2m|500ms|default]", "warning");
+			return;
+		}
+
+		state.settings = {
+			...state.settings,
+			delayMs: parsed === "default" ? DEFAULT_SUMMARY_DELAY_MS : parsed,
+		};
+		await persistSettings(ctx);
+		ctx.ui.notify(`Session recap delay: ${formatDuration(state.settings.delayMs)}`, "info");
+	};
+
+	pi.registerCommand("session-recap", {
+		description:
+			"Configure the session recap (usage: /session-recap [on|off|toggle|status|refresh|model|delay])",
+		getArgumentCompletions: getSessionRecapCompletions,
 		handler: async (args, ctx) => {
-			const action = normalizeWhitespace(args).toLowerCase() || "status";
+			const normalizedArgs = normalizeWhitespace(args);
+			const [actionRaw, ...restParts] = normalizedArgs ? normalizedArgs.split(" ") : ["status"];
+			const action = actionRaw.toLowerCase();
+			const rest = restParts.join(" ");
 
 			if (action === "status") {
-				ctx.ui.notify(`Summary: ${state.enabled ? "on" : "off"}`, "info");
+				ctx.ui.notify(
+					[
+						`Session recap: ${state.settings.enabled ? "on" : "off"}`,
+						`Model: ${formatModelSetting(state.settings)}`,
+						`Delay: ${formatDuration(state.settings.delayMs)}`,
+						`Settings: ${CONFIG_PATH}`,
+					].join("\n"),
+					"info",
+				);
 				return;
 			}
 
 			if (action === "on") {
-				pi.appendEntry(SETTINGS_ENTRY_TYPE, { enabled: true });
-				setEnabled(ctx, true);
-				ctx.ui.notify("Summary enabled", "info");
+				await setEnabled(ctx, true);
+				ctx.ui.notify("Session recap enabled", "info");
 				return;
 			}
 
 			if (action === "off") {
-				pi.appendEntry(SETTINGS_ENTRY_TYPE, { enabled: false });
-				setEnabled(ctx, false);
-				ctx.ui.notify("Summary hidden", "info");
+				await setEnabled(ctx, false);
+				ctx.ui.notify("Session recap hidden", "info");
 				return;
 			}
 
 			if (action === "toggle") {
-				const nextEnabled = !state.enabled;
-				pi.appendEntry(SETTINGS_ENTRY_TYPE, { enabled: nextEnabled });
-				setEnabled(ctx, nextEnabled);
-				ctx.ui.notify(nextEnabled ? "Summary enabled" : "Summary hidden", "info");
+				const nextEnabled = !state.settings.enabled;
+				await setEnabled(ctx, nextEnabled);
+				ctx.ui.notify(nextEnabled ? "Session recap enabled" : "Session recap hidden", "info");
 				return;
 			}
 
-			ctx.ui.notify("Usage: /summary [on|off|toggle|status]", "warning");
+			if (action === "refresh") {
+				if (!state.settings.enabled) {
+					ctx.ui.notify("Session recap is off. Run /session-recap on first.", "warning");
+					return;
+				}
+				await ctx.waitForIdle();
+				clearScheduledUpdate();
+				state.lastSummarizedLeafId = undefined;
+				await generateSynopsis(ctx, { force: true });
+				ctx.ui.notify("Session recap refreshed", "info");
+				return;
+			}
+
+			if (action === "model") {
+				await setSummaryModel(ctx, rest);
+				return;
+			}
+
+			if (action === "delay") {
+				await setSummaryDelay(ctx, rest);
+				return;
+			}
+
+			ctx.ui.notify("Usage: /session-recap [on|off|toggle|status|refresh|model|delay]", "warning");
 		},
 	});
 
-	pi.on("session_start", (_event, ctx) => {
-		reset(ctx);
+	pi.on("session_start", async (_event, ctx) => {
+		refreshModelCompletions(ctx);
+		await reset(ctx);
 	});
 
-	pi.on("session_tree", (_event, ctx) => {
-		reset(ctx);
+	pi.on("session_tree", async (_event, ctx) => {
+		refreshModelCompletions(ctx);
+		await reset(ctx);
 		scheduleUpdate(ctx);
+	});
+
+	pi.on("model_select", (_event, ctx) => {
+		refreshModelCompletions(ctx);
 	});
 
 	pi.on("agent_start", () => {
