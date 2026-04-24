@@ -1,43 +1,138 @@
-# pi-session-recap
+# pi-session-recap — one-line session context for Pi
 
-A Pi extension that keeps a one-line recap widget above the editor so you can quickly remember what the current session has been about.
+A Pi extension that keeps a one-line recap above the editor so long-running coding sessions are easier to resume.
 
-Features:
-- Generates a short recap from recent session context
-- Falls back to heuristics when no summarization model is available
-- Adds `/session-recap on|off|toggle|status|refresh|model|delay`
-- Lets you choose the recap model (`auto`, `current`, or a fixed `provider/model-id`)
-- Lets you tune how long Pi waits after an agent turn before refreshing the recap
+```bash
+pi install npm:@lukemelnik/pi-session-recap
+```
 
-Install locally:
-- `pi install /path/to/pi-session-recap`
+```text
+/session-recap status
+```
 
-Install from GitHub:
-- `pi install git:github.com/lukemelnik/pi-session-recap`
+## Features
 
-After publishing:
-- `pi install npm:@lukemelnik/pi-session-recap`
+- **Recap widget** — show the current session focus directly above Pi's editor.
+- **Idle refresh** — update the recap after agent turns once Pi is idle.
+- **Model selection** — choose `auto`, the current active model, or a fixed `provider/model-id`.
+- **Fallback summaries** — use local heuristics when no authenticated recap model is available.
+- **Configurable delay** — refresh immediately or after delays such as `10s`, `30s`, `2m`, or `1h`.
+- **Command autocomplete** — complete subcommands, delays, and authenticated model IDs.
 
-Usage:
-- `/session-recap` — show whether recaps are enabled, the configured model, and the delay
-- `/session-recap on` / `/session-recap off` — show or hide the recap widget
-- `/session-recap model` — open a model picker for authenticated models
-- `/session-recap model auto` — use the first available cheap recap model, then fall back to the active model
-- `/session-recap model current` — always use the active model
-- `/session-recap model openai/gpt-5.4-mini` — use a fixed model
-- `/session-recap delay 2m` — wait two minutes after each agent turn before refreshing
-- `/session-recap delay default` — restore the default 30 second delay
-- `/session-recap refresh` — regenerate the recap immediately from recent context
+## Install
 
-Argument autocomplete suggests subcommands, common delays, `auto`/`current`, and authenticated `provider/model-id` values for model selection.
+Install from npm:
 
-Settings are stored in `~/.pi/agent/session-recap.json`.
+```bash
+pi install npm:@lukemelnik/pi-session-recap
+```
 
-Release:
-- `npm run release:patch` or `npm run release:minor` or `npm run release:major`
-- `git push origin HEAD --follow-tags`
-- `npm run publish:release`
+Install project-locally instead of globally:
 
-`npm version` is the source of truth for releases here: it updates `package.json`, updates `package-lock.json`, creates a release commit, and creates a `vX.Y.Z` git tag.
+```bash
+pi install npm:@lukemelnik/pi-session-recap -l
+```
 
-No build step is required. Pi loads `src/index.ts` directly.
+Install from GitHub or a local checkout:
+
+```bash
+pi install git:github.com/lukemelnik/pi-session-recap
+pi install /absolute/path/to/pi-session-recap
+```
+
+## Quick Start
+
+Install the package, open Pi, then check the current recap configuration:
+
+```text
+/session-recap status
+```
+
+Use the default model selection and refresh delay:
+
+```text
+/session-recap model auto
+/session-recap delay default
+```
+
+Regenerate the recap immediately from recent session context:
+
+```text
+/session-recap refresh
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/session-recap` | Show current settings. Same as `/session-recap status`. |
+| `/session-recap status` | Show whether the widget is enabled, the recap model, delay, and settings path. |
+| `/session-recap on` | Show the recap widget and refresh after agent turns. |
+| `/session-recap off` | Hide the recap widget and stop refreshes. |
+| `/session-recap toggle` | Toggle the recap widget. |
+| `/session-recap refresh` | Regenerate the recap immediately from recent context. |
+| `/session-recap model` | Open a model picker for authenticated models. |
+| `/session-recap model auto` | Use the first available recap candidate, then fall back to the current active model. |
+| `/session-recap model current` | Always use the current active Pi model. |
+| `/session-recap model <provider>/<model-id>` | Use a fixed model for recaps. |
+| `/session-recap delay` | Show the current refresh delay. |
+| `/session-recap delay <duration>` | Set the refresh delay. Supports `ms`, `s`, `m`, and `h`. |
+| `/session-recap delay default` | Restore the default 30 second delay. |
+
+## Model Behavior
+
+The `auto` model mode tries these authenticated models first, then falls back to the active Pi model:
+
+1. `openai-codex/gpt-5.4-mini`
+2. `openai/gpt-5.4-mini`
+3. `openrouter/openai/gpt-5.4-mini`
+
+If no authenticated model is available, the extension generates a best-effort local fallback from recent user requests and file paths.
+
+The selected recap model receives recent session text so it can summarize the actual task. Use `/session-recap off` if recap context should not be sent to a model provider.
+
+## Configuration
+
+Settings are stored globally at:
+
+```text
+~/.pi/agent/session-recap.json
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Whether the recap widget is shown. |
+| `delayMs` | `30000` | Delay after an agent turn before refreshing. |
+| `modelMode` | `auto` | One of `auto`, `current`, or `fixed`. |
+| `provider` | unset | Provider used when `modelMode` is `fixed`. |
+| `modelId` | unset | Model ID used when `modelMode` is `fixed`. |
+
+Settings changes are also written into the current Pi session so resumed or forked sessions keep their recap choices.
+
+## Manage the Package
+
+```bash
+pi list
+pi config
+pi update npm:@lukemelnik/pi-session-recap
+pi remove npm:@lukemelnik/pi-session-recap
+```
+
+If the package was installed project-locally, pass `-l` to `pi remove`:
+
+```bash
+pi remove npm:@lukemelnik/pi-session-recap -l
+```
+
+## Requirements
+
+- Pi with package support.
+- An authenticated model for generated recaps. Without one, local fallback summaries still work.
+
+## Development
+
+Maintainer setup, type checking, and release commands are documented in [docs/development.md](docs/development.md).
+
+## License
+
+MIT
