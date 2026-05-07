@@ -1,6 +1,6 @@
 {
   "name": "@lukemelnik/pi-session-recap",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A Pi extension that shows a one-line recap of what the current session has been about.",
   "type": "module",
   "author": "Luke Melnik",
