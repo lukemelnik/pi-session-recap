@@ -16,6 +16,7 @@ pi install npm:@lukemelnik/pi-session-recap
 - **Idle refresh** — update the recap after agent turns once Pi is idle.
 - **Model selection** — choose `auto`, the current active model, or a fixed `provider/model-id`.
 - **Fallback summaries** — use local heuristics when no authenticated recap model is available.
+- **Session persistence** — save the latest recap as extension state so resumed sessions and external monitors can read it.
 - **Configurable delay** — refresh immediately or after delays such as `10s`, `30s`, `2m`, or `1h`.
 - **Command autocomplete** — complete subcommands, delays, and authenticated model IDs.
 
@@ -108,6 +109,25 @@ Settings are stored globally at:
 | `modelId` | unset | Model ID used when `modelMode` is `fixed`. |
 
 Settings changes are also written into the current Pi session so resumed or forked sessions keep their recap choices.
+
+## Session State
+
+The latest generated recap is saved in the current Pi session as a custom extension entry:
+
+```json
+{
+  "type": "custom",
+  "customType": "session-synopsis-state",
+  "data": {
+    "schemaVersion": 1,
+    "synopsis": "Debugging API integration failures in Songkeeper",
+    "lastSummarizedLeafId": "abc123",
+    "updatedAt": 1778165000000
+  }
+}
+```
+
+Pi custom entries are extension state and are not sent to the model as conversation context. Consumers should read the current branch from newest to oldest and use the first `session-synopsis-state` entry.
 
 ## Manage the Package
 
