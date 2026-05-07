@@ -7,6 +7,7 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@mariozechner
 
 const WIDGET_KEY = "session-synopsis";
 const SETTINGS_ENTRY_TYPE = "session-synopsis-settings";
+const SYNOPSIS_STATE_ENTRY_TYPE = "session-synopsis-state";
 const SUMMARY_MODEL_CANDIDATES = [
 	{ provider: "openai-codex", modelId: "gpt-5.4-mini" },
 	{ provider: "openai", modelId: "gpt-5.4-mini" },
@@ -43,11 +44,20 @@ interface SynopsisState {
 	settings: SynopsisSettings;
 	synopsis?: string;
 	lastSummarizedLeafId?: string;
+	lastPersistedSynopsis?: string;
+	lastPersistedLeafId?: string;
 	generation: number;
 	inFlight: boolean;
 	pending: boolean;
 	pendingCtx?: ExtensionContext;
 	idleTimer?: ReturnType<typeof setTimeout>;
+}
+
+interface PersistedSynopsisState {
+	schemaVersion: 1;
+	synopsis: string;
+	lastSummarizedLeafId?: string;
+	updatedAt: number;
 }
 
 interface SummaryMessage {
@@ -139,6 +149,32 @@ function getPersistedSessionSettings(ctx: ExtensionContext): Partial<SynopsisSet
 			result.modelId = normalized.modelId;
 		}
 		return result;
+	}
+	return {};
+}
+
+function normalizePersistedSynopsisState(raw: unknown): Pick<SynopsisState, "synopsis" | "lastSummarizedLeafId"> {
+	if (!raw || typeof raw !== "object") return {};
+
+	const data = raw as { synopsis?: unknown; lastSummarizedLeafId?: unknown };
+	if (typeof data.synopsis !== "string" || !data.synopsis.trim()) return {};
+
+	const synopsis = normalizeSynopsis(data.synopsis);
+	if (!synopsis) return {};
+
+	return {
+		synopsis,
+		lastSummarizedLeafId: typeof data.lastSummarizedLeafId === "string" ? data.lastSummarizedLeafId : undefined,
+	};
+}
+
+function getPersistedSynopsisState(ctx: ExtensionContext): Pick<SynopsisState, "synopsis" | "lastSummarizedLeafId"> {
+	const entries = ctx.sessionManager.getBranch();
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type !== "custom" || entry.customType !== SYNOPSIS_STATE_ENTRY_TYPE) continue;
+		const result = normalizePersistedSynopsisState(entry.data);
+		if (result.synopsis) return result;
 	}
 	return {};
 }
@@ -579,13 +615,36 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Failed to load session recap settings: ${message}`, "warning");
 			}
 		}
+		const persistedSynopsis = getPersistedSynopsisState(ctx);
 		state.generation += 1;
-		state.synopsis = undefined;
-		state.lastSummarizedLeafId = undefined;
+		state.synopsis = persistedSynopsis.synopsis;
+		state.lastSummarizedLeafId = persistedSynopsis.lastSummarizedLeafId;
+		state.lastPersistedSynopsis = persistedSynopsis.synopsis;
+		state.lastPersistedLeafId = persistedSynopsis.lastSummarizedLeafId;
 		state.inFlight = false;
 		state.pending = false;
 		state.pendingCtx = undefined;
-		renderSynopsis(ctx, undefined);
+		renderSynopsis(ctx, state.settings.enabled ? state.synopsis : undefined);
+	};
+
+	const persistSynopsis = (): void => {
+		if (!state.synopsis) return;
+		if (state.synopsis === state.lastPersistedSynopsis && state.lastSummarizedLeafId === state.lastPersistedLeafId) return;
+
+		const data: PersistedSynopsisState = {
+			schemaVersion: 1,
+			synopsis: state.synopsis,
+			lastSummarizedLeafId: state.lastSummarizedLeafId,
+			updatedAt: Date.now(),
+		};
+
+		try {
+			pi.appendEntry(SYNOPSIS_STATE_ENTRY_TYPE, data);
+			state.lastPersistedSynopsis = state.synopsis;
+			state.lastPersistedLeafId = state.lastSummarizedLeafId;
+		} catch {
+			// Recap persistence should never affect the session.
+		}
 	};
 
 	const generateSynopsis = async (ctx: ExtensionContext, options: { force?: boolean } = {}) => {
@@ -611,6 +670,7 @@ export default function (pi: ExtensionAPI) {
 			if (!summaryModel) {
 				state.synopsis = buildFallbackSynopsis(branch, state.lastSummarizedLeafId, state.synopsis);
 				state.lastSummarizedLeafId = branch.at(-1)?.id;
+				persistSynopsis();
 				renderSynopsis(ctx, state.synopsis);
 				return;
 			}
@@ -645,6 +705,7 @@ export default function (pi: ExtensionAPI) {
 				if (response.stopReason === "error" || response.stopReason === "aborted") {
 					state.synopsis = buildFallbackSynopsis(branch, state.lastSummarizedLeafId, state.synopsis);
 					state.lastSummarizedLeafId = branch.at(-1)?.id;
+					persistSynopsis();
 					renderSynopsis(ctx, state.synopsis);
 					return;
 				}
@@ -658,16 +719,19 @@ export default function (pi: ExtensionAPI) {
 				if (!raw) {
 					state.synopsis = buildFallbackSynopsis(branch, state.lastSummarizedLeafId, state.synopsis);
 					state.lastSummarizedLeafId = branch.at(-1)?.id;
+					persistSynopsis();
 					renderSynopsis(ctx, state.synopsis);
 					return;
 				}
 
 				state.synopsis = normalizeSynopsis(raw);
 				state.lastSummarizedLeafId = branch.at(-1)?.id;
+				persistSynopsis();
 				renderSynopsis(ctx, state.synopsis);
 			} catch {
 				state.synopsis = buildFallbackSynopsis(branch, state.lastSummarizedLeafId, state.synopsis);
 				state.lastSummarizedLeafId = branch.at(-1)?.id;
+				persistSynopsis();
 				renderSynopsis(ctx, state.synopsis);
 			}
 		} finally {
